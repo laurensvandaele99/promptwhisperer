@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: prompt-risk-model
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: MODEL_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"

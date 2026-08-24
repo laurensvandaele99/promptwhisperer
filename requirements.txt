@@ -1,0 +1,6 @@
+# API/runtime dependencies. Model-specific versions are pinned in model/requirements_model.txt
+# after running export_model.py on the same machine/environment used for analysis.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+python-dotenv>=1.0,<2

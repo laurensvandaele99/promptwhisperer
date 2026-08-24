@@ -1,0 +1,9 @@
+# This file is overwritten by export_model.py with the exact analysis-environment versions.
+# Do not deploy the final model until you have run export_model.py locally.
+numpy
+pandas
+scikit-learn
+xgboost
+joblib
+sentence-transformers
+nltk
