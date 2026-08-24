@@ -1,14 +1,15 @@
-import os
-import time
-import threading
-from pathlib import Path
-from typing import Any, Optional
+from __future__ import annotations
 
-import joblib
+import hmac
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
-
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -28,34 +29,53 @@ MODEL_PATH = Path(
     )
 )
 
-MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
+MODEL_API_KEY = os.getenv("MODEL_API_KEY", "").strip()
 
-# Optional:
-# ALLOWED_ORIGINS=https://your-lovable-app.lovable.app,https://yourdomain.com
-allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
+MAX_PROMPT_CHARS = int(
+    os.getenv("MAX_PROMPT_CHARS", "50000")
+)
 
-if allowed_origins_raw.strip() == "*":
-    ALLOWED_ORIGINS = ["*"]
-else:
-    ALLOWED_ORIGINS = [
-        x.strip()
-        for x in allowed_origins_raw.split(",")
-        if x.strip()
+
+def get_allowed_origins() -> list[str]:
+    """
+    Read allowed origins from the environment.
+
+    Examples:
+        ALLOWED_ORIGINS=*
+        ALLOWED_ORIGINS=https://my-app.lovable.app
+        ALLOWED_ORIGINS=https://a.com,https://b.com
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "*").strip()
+
+    if raw == "*":
+        return ["*"]
+
+    return [
+        origin.strip()
+        for origin in raw.split(",")
+        if origin.strip()
     ]
 
 
 # ============================================================
-# Global runtime objects
+# Runtime globals
+#
+# IMPORTANT:
+# We deliberately do NOT import sentence-transformers, torch,
+# sklearn, or xgboost here.
+#
+# This allows Render to start Uvicorn and bind to $PORT before
+# loading the memory-heavy ML stack.
 # ============================================================
 
-BUNDLE: Optional[dict[str, Any]] = None
-ENCODER: Optional[SentenceTransformer] = None
+BUNDLE: dict[str, Any] | None = None
+ENCODER: Any = None
 
 LOAD_LOCK = threading.Lock()
 
 
 # ============================================================
-# FastAPI app
+# FastAPI application
 # ============================================================
 
 app = FastAPI(
@@ -63,69 +83,109 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "Stateless scoring API for the frozen prompt-efficiency model. "
-        "The API predicts interaction-inefficiency risk from the initial prompt."
+        "The model uses only the initial prompt."
     ),
 )
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=get_allowed_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "X-API-Key",
+    ],
 )
 
 
 # ============================================================
-# Request / response schemas
+# Schemas
 # ============================================================
 
 class ScoreRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    participant_id: Optional[str] = None
+    participant_id: str | None = None
+
+
+class ScoreResponse(BaseModel):
+    risk: float
+    risk_definition: str
+    model_version: str
+    model_name: str
+    mode: str
+    latency_ms: float
+    probabilities: dict[str, float]
+
+    risk_class2: float | None = None
+    risk_1plus2: float | None = None
+    participant_id: str | None = None
 
 
 # ============================================================
 # Authentication
 # ============================================================
 
-def verify_api_key(x_api_key: Optional[str]) -> None:
+def require_api_key(
+    x_api_key: str | None = Header(
+        default=None,
+        alias="X-API-Key",
+    ),
+) -> None:
     """
-    Require X-API-Key when MODEL_API_KEY is configured.
+    Require an API key if MODEL_API_KEY is configured.
+
+    If MODEL_API_KEY is empty, authentication is disabled.
+    This can be useful for local testing but should not be used
+    for the live experiment.
     """
 
     if not MODEL_API_KEY:
         return
 
-    if not x_api_key or x_api_key != MODEL_API_KEY:
+    if not x_api_key:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing API key.",
+            detail="Missing API key",
+        )
+
+    if not hmac.compare_digest(
+        x_api_key,
+        MODEL_API_KEY,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
         )
 
 
 # ============================================================
-# Model loading
+# Lazy model loading
 # ============================================================
 
 def load_runtime() -> None:
     """
-    Lazily load the frozen model bundle and MiniLM encoder.
+    Load the exported model and MiniLM encoder.
 
-    Nothing is loaded during FastAPI startup. This is intentional:
-    Render can bind to its HTTP port immediately instead of waiting
-    for sentence-transformers / PyTorch initialization.
+    This function is deliberately called only by /warmup or
+    /score. It is NOT called when FastAPI starts.
+
+    This is important on Render because importing PyTorch and
+    SentenceTransformers before Uvicorn binds to the port can
+    cause Render to report 'No open ports detected'.
     """
 
     global BUNDLE, ENCODER
 
+    # Already loaded
     if BUNDLE is not None and ENCODER is not None:
         return
 
     with LOAD_LOCK:
 
-        # Another request may have finished loading while this one waited.
+        # A different request may have loaded everything while
+        # this request was waiting for the lock.
         if BUNDLE is not None and ENCODER is not None:
             return
 
@@ -134,44 +194,82 @@ def load_runtime() -> None:
                 f"Model bundle not found at: {MODEL_PATH}"
             )
 
-        print(f"Loading model bundle from: {MODEL_PATH}", flush=True)
+        print(
+            f"[MODEL] Loading bundle from {MODEL_PATH}",
+            flush=True,
+        )
+
+        # Import joblib lazily as well. Loading the pipeline may
+        # cause sklearn/xgboost to be imported.
+        import joblib
 
         bundle = joblib.load(MODEL_PATH)
 
         if not isinstance(bundle, dict):
             raise RuntimeError(
-                "model_bundle.joblib does not contain the expected dictionary."
+                "The model bundle is not a dictionary."
             )
 
-        if "model" not in bundle:
-            raise RuntimeError(
-                "Model bundle is missing key 'model'. "
-                f"Available keys: {list(bundle.keys())}"
-            )
-
-        embedding_model_name = bundle.get(
+        required_keys = [
+            "pipeline",
+            "model_name",
+            "model_version",
+            "mode",
+            "risk_definition",
+            "numeric_cols",
+            "categorical_cols",
+            "embedding_cols",
             "embedding_model_name",
-            "sentence-transformers/all-MiniLM-L6-v2",
-        )
+            "prompt_col",
+        ]
+
+        missing_keys = [
+            key
+            for key in required_keys
+            if key not in bundle
+        ]
+
+        if missing_keys:
+            raise RuntimeError(
+                "Model bundle is missing required keys: "
+                + ", ".join(missing_keys)
+            )
+
+        if bundle["prompt_col"] != PROMPT_COL:
+            raise RuntimeError(
+                "Prompt-column mismatch between model bundle "
+                "and features.py. "
+                f"Bundle: {bundle['prompt_col']}; "
+                f"service: {PROMPT_COL}"
+            )
+
+        embedding_model_name = bundle[
+            "embedding_model_name"
+        ]
 
         print(
-            f"Loading sentence encoder: {embedding_model_name}",
+            "[MODEL] Loading sentence encoder: "
+            f"{embedding_model_name}",
             flush=True,
         )
-from sentence_transformers import SentenceTransformer
 
-encoder = SentenceTransformer(
-    embedding_model_name,
-    device="cpu"
-)
-        encoder = SentenceTransformer(embedding_model_name)
+        # CRITICAL:
+        # Do not move this import to the top of app.py.
+        # sentence-transformers imports PyTorch and uses a lot
+        # of memory.
+        from sentence_transformers import SentenceTransformer
 
-        # Assign only after everything loaded successfully.
+        encoder = SentenceTransformer(
+            embedding_model_name,
+            device="cpu",
+        )
+
+        # Only set globals after everything loaded correctly.
         BUNDLE = bundle
         ENCODER = encoder
 
         print(
-            "Model runtime loaded successfully.",
+            "[MODEL] Runtime loaded successfully.",
             flush=True,
         )
 
@@ -180,35 +278,34 @@ encoder = SentenceTransformer(
 # Feature construction
 # ============================================================
 
-def make_model_input(prompt: str) -> pd.DataFrame:
+def build_model_frame(
+    prompt: str,
+) -> pd.DataFrame:
     """
-    Reproduce the inference features used by the frozen model:
-      1. handcrafted initial-prompt features
-      2. MiniLM sentence embedding
-      3. exact feature ordering stored in the exported bundle
+    Reproduce the exact feature representation expected by the
+    exported model:
+
+        handcrafted features
+        +
+        384 MiniLM dimensions
     """
 
     if BUNDLE is None or ENCODER is None:
-        raise RuntimeError("Runtime has not been loaded.")
+        raise RuntimeError(
+            "Model runtime has not been loaded."
+        )
 
     # --------------------------------------------------------
     # Handcrafted features
     # --------------------------------------------------------
 
-    raw_df = pd.DataFrame(
+    frame = pd.DataFrame(
         {
             PROMPT_COL: [prompt]
         }
     )
 
-    handcrafted = build_handcrafted_features(raw_df)
-
-    if not isinstance(handcrafted, pd.DataFrame):
-        raise RuntimeError(
-            "build_handcrafted_features() did not return a DataFrame."
-        )
-
-    handcrafted = handcrafted.reset_index(drop=True)
+    feat = build_handcrafted_features(frame)
 
     # --------------------------------------------------------
     # MiniLM embedding
@@ -216,248 +313,214 @@ def make_model_input(prompt: str) -> pd.DataFrame:
 
     embedding = ENCODER.encode(
         [prompt],
-        convert_to_numpy=True,
+        normalize_embeddings=bool(
+            BUNDLE.get(
+                "embedding_normalize",
+                False,
+            )
+        ),
         show_progress_bar=False,
-        normalize_embeddings=False,
+        convert_to_numpy=True,
     )
 
-    embedding = np.asarray(embedding, dtype=np.float32)
-
-    if embedding.ndim != 2 or embedding.shape[0] != 1:
-        raise RuntimeError(
-            f"Unexpected embedding shape: {embedding.shape}"
-        )
-
-    # --------------------------------------------------------
-    # Determine the exact model columns
-    # --------------------------------------------------------
-
-    feature_columns = BUNDLE.get("feature_columns")
-
-    if feature_columns is None:
-        feature_columns = BUNDLE.get("model_feature_columns")
-
-    if feature_columns is None:
-        model = BUNDLE["model"]
-
-        if hasattr(model, "feature_names_in_"):
-            feature_columns = list(model.feature_names_in_)
-        else:
-            raise RuntimeError(
-                "Could not determine model feature ordering. "
-                "The bundle must contain 'feature_columns' or "
-                "'model_feature_columns'."
-            )
-
-    feature_columns = list(feature_columns)
-
-    # Explicit exported column lists are preferred.
-    handcrafted_columns = BUNDLE.get("handcrafted_columns")
-    embedding_columns = BUNDLE.get("embedding_columns")
-
-    if handcrafted_columns is not None:
-        handcrafted_columns = list(handcrafted_columns)
-
-    if embedding_columns is not None:
-        embedding_columns = list(embedding_columns)
-
-    # --------------------------------------------------------
-    # Infer handcrafted columns if necessary
-    # --------------------------------------------------------
-
-    if handcrafted_columns is None:
-        handcrafted_columns = [
-            col
-            for col in feature_columns
-            if col in handcrafted.columns
-        ]
-
-    # --------------------------------------------------------
-    # Infer embedding columns if necessary
-    # --------------------------------------------------------
-
-    if embedding_columns is None:
-        embedding_columns = [
-            col
-            for col in feature_columns
-            if col not in handcrafted_columns
-        ]
-
-    if len(embedding_columns) != embedding.shape[1]:
-        raise RuntimeError(
-            "Embedding dimensionality does not match the exported "
-            "feature structure. "
-            f"Encoder returned {embedding.shape[1]} dimensions, "
-            f"but {len(embedding_columns)} embedding columns were expected."
-        )
-
-    # --------------------------------------------------------
-    # Construct exact single-row model matrix
-    # --------------------------------------------------------
-
-    X = pd.DataFrame(
-        np.zeros((1, len(feature_columns)), dtype=np.float32),
-        columns=feature_columns,
+    embedding = np.asarray(
+        embedding,
+        dtype=np.float32,
     )
 
-    # Handcrafted values
-    for col in handcrafted_columns:
-        if col not in handcrafted.columns:
-            raise RuntimeError(
-                f"Expected handcrafted feature '{col}' was not generated."
+    embedding_cols = list(
+        BUNDLE["embedding_cols"]
+    )
+
+    if embedding.ndim != 2:
+        raise RuntimeError(
+            "Unexpected embedding dimensionality: "
+            f"{embedding.shape}"
+        )
+
+    if embedding.shape[0] != 1:
+        raise RuntimeError(
+            "Expected one embedding row, received "
+            f"{embedding.shape[0]}"
+        )
+
+    if embedding.shape[1] != len(
+        embedding_cols
+    ):
+        raise RuntimeError(
+            "Embedding dimension mismatch: "
+            f"encoder produced {embedding.shape[1]}, "
+            f"but model expects {len(embedding_cols)}"
+        )
+
+    # Add all embedding columns at once rather than one by one.
+    # This avoids pandas DataFrame fragmentation warnings.
+    embedding_frame = pd.DataFrame(
+        embedding,
+        columns=embedding_cols,
+        index=feat.index,
+    )
+
+    feat = pd.concat(
+        [
+            feat,
+            embedding_frame,
+        ],
+        axis=1,
+    )
+
+    # --------------------------------------------------------
+    # Exact model columns
+    # --------------------------------------------------------
+
+    feature_cols = (
+        list(BUNDLE["numeric_cols"])
+        + list(BUNDLE["categorical_cols"])
+    )
+
+    missing_features = [
+        col
+        for col in feature_cols
+        if col not in feat.columns
+    ]
+
+    if missing_features:
+        raise RuntimeError(
+            "Missing model features: "
+            + ", ".join(
+                missing_features[:20]
             )
+        )
 
-        value = handcrafted.loc[0, col]
-
-        try:
-            X.loc[0, col] = float(value)
-        except (TypeError, ValueError):
-            X.loc[0, col] = 0.0
-
-    # Embedding values
-    X.loc[0, embedding_columns] = embedding[0]
-
-    # Replace any problematic numeric values
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # Guarantee original training order
-    X = X[feature_columns]
-
-    return X
+    return feat[feature_cols]
 
 
 # ============================================================
-# Scoring
+# Prediction
 # ============================================================
 
-def _score(prompt: str) -> dict[str, Any]:
+def score_prompt(
+    prompt: str,
+) -> dict[str, Any]:
+    """
+    Calculate interaction-risk probabilities for one prompt.
+    """
 
-    start_time = time.perf_counter()
-
-    # Lazy loading happens here, NOT during web-server startup.
     load_runtime()
 
-    assert BUNDLE is not None
+    if BUNDLE is None:
+        raise RuntimeError(
+            "Model bundle failed to load."
+        )
 
-    model = BUNDLE["model"]
-
-    X = make_model_input(prompt)
-
-    probs = model.predict_proba(X)[0]
-
-    classes = list(model.classes_)
-
-    probability_map: dict[str, float] = {}
-
-    for cls, prob in zip(classes, probs):
-        try:
-            cls_string = str(int(cls))
-        except (TypeError, ValueError):
-            cls_string = str(cls)
-
-        probability_map[cls_string] = float(prob)
-
-    mode = BUNDLE.get(
-        "mode",
-        "multiclass_class2",
+    model_frame = build_model_frame(
+        prompt
     )
 
-    model_version = BUNDLE.get(
-        "model_version",
-        "unknown",
-    )
+    pipeline = BUNDLE["pipeline"]
 
-    model_name = BUNDLE.get(
-        "model_name",
-        model.__class__.__name__,
-    )
+    probabilities = np.asarray(
+        pipeline.predict_proba(
+            model_frame
+        )
+    )[0]
+
+    mode = BUNDLE["mode"]
+
+    risk_class2: float | None = None
+    risk_1plus2: float | None = None
 
     # --------------------------------------------------------
-    # Different supported outcome definitions
+    # Five-class model
     # --------------------------------------------------------
 
-    risk_class2 = None
-    risk_1plus2 = None
+    if mode.startswith("multiclass"):
 
-    if "2" in probability_map:
-        risk_class2 = probability_map["2"]
-
-    if "1" in probability_map and "2" in probability_map:
-        risk_1plus2 = (
-            probability_map["1"]
-            + probability_map["2"]
-        )
-
-    if mode == "multiclass_class2":
-
-        if risk_class2 is None:
+        if len(probabilities) != 5:
             raise RuntimeError(
-                "Class 2 probability is unavailable."
+                "Expected five probabilities from "
+                f"multiclass model, got {len(probabilities)}"
             )
 
-        risk = risk_class2
+        probability_map = {
+            str(i + 1): float(
+                probabilities[i]
+            )
+            for i in range(5)
+        }
 
-        risk_definition = (
-            "P(strict_efficiency_score = 2)"
+        risk_class2 = float(
+            probabilities[1]
         )
 
-    elif mode == "multiclass_1plus2":
+        risk_1plus2 = float(
+            probabilities[0]
+            + probabilities[1]
+        )
 
-        if risk_1plus2 is None:
-            raise RuntimeError(
-                "Class 1+2 probability is unavailable."
+        if mode == "multiclass_class2":
+            risk = risk_class2
+
+        elif mode == "multiclass_1plus2":
+            risk = risk_1plus2
+
+        else:
+            risk_indices = BUNDLE.get(
+                "risk_probability_indices",
+                [],
             )
 
-        risk = risk_1plus2
+            if not risk_indices:
+                raise RuntimeError(
+                    "No risk probability indices "
+                    "defined in model bundle."
+                )
 
-        risk_definition = (
-            "P(strict_efficiency_score in {1,2})"
-        )
+            risk = float(
+                np.sum(
+                    probabilities[
+                        risk_indices
+                    ]
+                )
+            )
+
+    # --------------------------------------------------------
+    # Binary 1+2 versus 3-5 model
+    # --------------------------------------------------------
 
     elif mode == "binary_1plus2":
 
-        # For a binary model, positive class should be coded 1.
-        if "1" not in probability_map:
+        if len(probabilities) != 2:
             raise RuntimeError(
-                "Positive class probability unavailable for "
-                "binary_1plus2 mode."
+                "Expected two probabilities from "
+                f"binary model, got {len(probabilities)}"
             )
 
-        risk = probability_map["1"]
+        probability_map = {
+            "scores_3_5": float(
+                probabilities[0]
+            ),
+            "scores_1_2": float(
+                probabilities[1]
+            ),
+        }
+
+        risk = float(
+            probabilities[1]
+        )
 
         risk_1plus2 = risk
-
-        risk_definition = (
-            "P(strict_efficiency_score in {1,2})"
-        )
 
     else:
         raise RuntimeError(
             f"Unsupported model mode: {mode}"
         )
 
-    latency_ms = (
-        time.perf_counter() - start_time
-    ) * 1000.0
-
     return {
         "risk": float(risk),
-        "risk_definition": risk_definition,
-        "model_version": model_version,
-        "model_name": model_name,
-        "mode": mode,
-        "latency_ms": round(latency_ms, 2),
         "probabilities": probability_map,
-        "risk_class2": (
-            float(risk_class2)
-            if risk_class2 is not None
-            else None
-        ),
-        "risk_1plus2": (
-            float(risk_1plus2)
-            if risk_1plus2 is not None
-            else None
-        ),
+        "risk_class2": risk_class2,
+        "risk_1plus2": risk_1plus2,
     }
 
 
@@ -467,6 +530,10 @@ def _score(prompt: str) -> dict[str, Any]:
 
 @app.get("/")
 def root():
+    """
+    Lightweight route. Does not load ML libraries.
+    """
+
     return {
         "service": "Prompt Interaction-Risk API",
         "status": "running",
@@ -474,19 +541,22 @@ def root():
             BUNDLE is not None
             and ENCODER is not None
         ),
-        "docs": "/docs",
-        "health": "/health",
+        "health_endpoint": "/health",
+        "score_endpoint": "/score",
+        "warmup_endpoint": "/warmup",
+        "docs_endpoint": "/docs",
     }
 
 
 @app.get("/health")
 def health():
     """
-    Lightweight health check.
+    VERY lightweight health check.
 
-    IMPORTANT:
-    This endpoint deliberately does NOT load MiniLM or XGBoost.
-    Render can therefore detect the open web port immediately.
+    Do not call load_runtime() here.
+
+    Render should be able to detect the HTTP port without
+    loading PyTorch/MiniLM/XGBoost.
     """
 
     return {
@@ -499,82 +569,163 @@ def health():
     }
 
 
-@app.post("/warmup")
-def warmup(
-    x_api_key: Optional[str] = Header(
-        default=None,
-        alias="X-API-Key",
-    )
-):
-    """
-    Manually load the model after deployment.
-
-    Useful for warming up Render before participants enter
-    the experiment.
-    """
-
-    verify_api_key(x_api_key)
-
-    start = time.perf_counter()
-
-    load_runtime()
-
-    elapsed = time.perf_counter() - start
-
-    return {
-        "status": "ready",
-        "model_loaded": True,
-        "load_time_seconds": round(elapsed, 2),
-        "model_version": (
-            BUNDLE.get("model_version", "unknown")
-            if BUNDLE
-            else "unknown"
-        ),
-    }
-
-
-@app.post("/score")
-def score(
-    request: ScoreRequest,
-    x_api_key: Optional[str] = Header(
-        default=None,
-        alias="X-API-Key",
-    ),
-):
-    """
-    Score one untouched initial participant prompt.
-    """
-
-    verify_api_key(x_api_key)
-
-    prompt = request.prompt.strip()
-
-    if not prompt:
-        raise HTTPException(
-            status_code=422,
-            detail="Prompt cannot be empty.",
+@app.post(
+    "/warmup",
+    dependencies=[
+        Depends(
+            require_api_key
         )
+    ],
+)
+def warmup():
+    """
+    Explicitly load the model after the HTTP server has started.
+
+    Call this once before launching the experiment.
+    """
+
+    started = time.perf_counter()
 
     try:
-        result = _score(prompt)
-
-        # participant_id is deliberately returned only for
-        # request matching; it is not used by the model.
-        if request.participant_id is not None:
-            result["participant_id"] = request.participant_id
-
-        return result
-
-    except HTTPException:
-        raise
+        load_runtime()
 
     except Exception as exc:
         print(
-            f"Scoring error: {type(exc).__name__}: {exc}",
+            "[WARMUP ERROR] "
+            f"{type(exc).__name__}: {exc}",
             flush=True,
         )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Scoring failed: {str(exc)}",
+            detail=(
+                "Model warmup failed: "
+                f"{type(exc).__name__}"
+            ),
+        ) from exc
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
+    assert BUNDLE is not None
+
+    return {
+        "status": "ready",
+        "model_loaded": True,
+        "model_name": BUNDLE[
+            "model_name"
+        ],
+        "model_version": BUNDLE[
+            "model_version"
+        ],
+        "mode": BUNDLE[
+            "mode"
+        ],
+        "risk_definition": BUNDLE[
+            "risk_definition"
+        ],
+        "load_time_seconds": round(
+            elapsed,
+            2,
+        ),
+    }
+
+
+@app.post(
+    "/score",
+    response_model=ScoreResponse,
+    dependencies=[
+        Depends(
+            require_api_key
         )
+    ],
+)
+def score(
+    req: ScoreRequest,
+):
+    """
+    Score one untouched initial prompt.
+    """
+
+    prompt = req.prompt
+
+    if not prompt.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Prompt cannot be blank.",
+        )
+
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Prompt exceeds "
+                f"MAX_PROMPT_CHARS="
+                f"{MAX_PROMPT_CHARS}"
+            ),
+        )
+
+    started = time.perf_counter()
+
+    try:
+        result = score_prompt(
+            prompt
+        )
+
+    except Exception as exc:
+
+        # Do not log the participant's actual prompt.
+        print(
+            "[SCORING ERROR] "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Scoring failed: "
+                f"{type(exc).__name__}"
+            ),
+        ) from exc
+
+    latency_ms = (
+        time.perf_counter()
+        - started
+    ) * 1000
+
+    assert BUNDLE is not None
+
+    return ScoreResponse(
+        risk=float(
+            result["risk"]
+        ),
+        risk_definition=BUNDLE[
+            "risk_definition"
+        ],
+        model_version=BUNDLE[
+            "model_version"
+        ],
+        model_name=BUNDLE[
+            "model_name"
+        ],
+        mode=BUNDLE[
+            "mode"
+        ],
+        latency_ms=round(
+            latency_ms,
+            2,
+        ),
+        probabilities=result[
+            "probabilities"
+        ],
+        risk_class2=result[
+            "risk_class2"
+        ],
+        risk_1plus2=result[
+            "risk_1plus2"
+        ],
+        participant_id=req.participant_id,
+    )
