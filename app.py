@@ -11,7 +11,6 @@ import pandas as pd
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 
 from features import PROMPT_COL, build_handcrafted_features
 
@@ -159,7 +158,12 @@ def load_runtime() -> None:
             f"Loading sentence encoder: {embedding_model_name}",
             flush=True,
         )
+from sentence_transformers import SentenceTransformer
 
+encoder = SentenceTransformer(
+    embedding_model_name,
+    device="cpu"
+)
         encoder = SentenceTransformer(embedding_model_name)
 
         # Assign only after everything loaded successfully.
