@@ -12,7 +12,6 @@ import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from features import PROMPT_COL, build_handcrafted_features
 
 
@@ -62,7 +61,7 @@ def get_allowed_origins() -> list[str]:
 #
 # IMPORTANT:
 # We deliberately do NOT import sentence-transformers, torch,
-# sklearn, or xgboost here.
+# or model-specific ML libraries here.
 #
 # This allows Render to start Uvicorn and bind to $PORT before
 # loading the memory-heavy ML stack.
@@ -72,6 +71,18 @@ BUNDLE: dict[str, Any] | None = None
 ENCODER: Any = None
 
 LOAD_LOCK = threading.Lock()
+
+
+def runtime_ready() -> bool:
+    """Return True when the bundle and any required encoder are loaded."""
+    if BUNDLE is None:
+        return False
+
+    embedding_cols = list(BUNDLE.get("embedding_cols", []))
+    if embedding_cols and ENCODER is None:
+        return False
+
+    return True
 
 
 # ============================================================
@@ -166,27 +177,24 @@ def require_api_key(
 
 def load_runtime() -> None:
     """
-    Load the exported model and MiniLM encoder.
+    Load the exported model bundle and, only when needed, the
+    MiniLM sentence encoder.
 
-    This function is deliberately called only by /warmup or
-    /score. It is NOT called when FastAPI starts.
+    The model target is defined by the exported bundle. For the
+    revised paper/experiment this can be a directly trained
+    ``binary_1plus2`` model, where risk means P(score in {1, 2}).
 
-    This is important on Render because importing PyTorch and
-    SentenceTransformers before Uvicorn binds to the port can
-    cause Render to report 'No open ports detected'.
+    Loading remains lazy so Render can bind to $PORT before the
+    memory-heavy ML stack is initialized.
     """
 
     global BUNDLE, ENCODER
 
-    # Already loaded
-    if BUNDLE is not None and ENCODER is not None:
+    if runtime_ready():
         return
 
     with LOAD_LOCK:
-
-        # A different request may have loaded everything while
-        # this request was waiting for the lock.
-        if BUNDLE is not None and ENCODER is not None:
+        if runtime_ready():
             return
 
         if not MODEL_PATH.exists():
@@ -199,8 +207,6 @@ def load_runtime() -> None:
             flush=True,
         )
 
-        # Import joblib lazily as well. Loading the pipeline may
-        # cause sklearn/xgboost to be imported.
         import joblib
 
         bundle = joblib.load(MODEL_PATH)
@@ -218,8 +224,6 @@ def load_runtime() -> None:
             "risk_definition",
             "numeric_cols",
             "categorical_cols",
-            "embedding_cols",
-            "embedding_model_name",
             "prompt_col",
         ]
 
@@ -243,28 +247,42 @@ def load_runtime() -> None:
                 f"service: {PROMPT_COL}"
             )
 
-        embedding_model_name = bundle[
-            "embedding_model_name"
-        ]
-
-        print(
-            "[MODEL] Loading sentence encoder: "
-            f"{embedding_model_name}",
-            flush=True,
+        embedding_cols = list(
+            bundle.get("embedding_cols", [])
         )
 
-        # CRITICAL:
-        # Do not move this import to the top of app.py.
-        # sentence-transformers imports PyTorch and uses a lot
-        # of memory.
-        from sentence_transformers import SentenceTransformer
+        encoder = None
 
-        encoder = SentenceTransformer(
-            embedding_model_name,
-            device="cpu",
-        )
+        if embedding_cols:
+            embedding_model_name = bundle.get(
+                "embedding_model_name"
+            )
 
-        # Only set globals after everything loaded correctly.
+            if not embedding_model_name:
+                raise RuntimeError(
+                    "The model expects embedding features but "
+                    "'embedding_model_name' is missing."
+                )
+
+            print(
+                "[MODEL] Loading sentence encoder: "
+                f"{embedding_model_name}",
+                flush=True,
+            )
+
+            from sentence_transformers import SentenceTransformer
+
+            encoder = SentenceTransformer(
+                embedding_model_name,
+                device="cpu",
+            )
+        else:
+            print(
+                "[MODEL] No embedding encoder required "
+                "(handcrafted-only bundle).",
+                flush=True,
+            )
+
         BUNDLE = bundle
         ENCODER = encoder
 
@@ -283,95 +301,74 @@ def build_model_frame(
 ) -> pd.DataFrame:
     """
     Reproduce the exact feature representation expected by the
-    exported model:
+    exported model. Supports both:
 
-        handcrafted features
-        +
-        384 MiniLM dimensions
+    - handcrafted + MiniLM bundles; and
+    - handcrafted-only bundles.
     """
 
-    if BUNDLE is None or ENCODER is None:
+    if BUNDLE is None:
         raise RuntimeError(
             "Model runtime has not been loaded."
         )
 
-    # --------------------------------------------------------
-    # Handcrafted features
-    # --------------------------------------------------------
-
     frame = pd.DataFrame(
-        {
-            PROMPT_COL: [prompt]
-        }
+        {PROMPT_COL: [prompt]}
     )
 
     feat = build_handcrafted_features(frame)
 
-    # --------------------------------------------------------
-    # MiniLM embedding
-    # --------------------------------------------------------
-
-    embedding = ENCODER.encode(
-        [prompt],
-        normalize_embeddings=bool(
-            BUNDLE.get(
-                "embedding_normalize",
-                False,
-            )
-        ),
-        show_progress_bar=False,
-        convert_to_numpy=True,
-    )
-
-    embedding = np.asarray(
-        embedding,
-        dtype=np.float32,
-    )
-
     embedding_cols = list(
-        BUNDLE["embedding_cols"]
+        BUNDLE.get("embedding_cols", [])
     )
 
-    if embedding.ndim != 2:
-        raise RuntimeError(
-            "Unexpected embedding dimensionality: "
-            f"{embedding.shape}"
+    if embedding_cols:
+        if ENCODER is None:
+            raise RuntimeError(
+                "The model expects embeddings but the sentence "
+                "encoder is not loaded."
+            )
+
+        embedding = ENCODER.encode(
+            [prompt],
+            normalize_embeddings=bool(
+                BUNDLE.get(
+                    "embedding_normalize",
+                    False,
+                )
+            ),
+            show_progress_bar=False,
+            convert_to_numpy=True,
         )
 
-    if embedding.shape[0] != 1:
-        raise RuntimeError(
-            "Expected one embedding row, received "
-            f"{embedding.shape[0]}"
+        embedding = np.asarray(
+            embedding,
+            dtype=np.float32,
         )
 
-    if embedding.shape[1] != len(
-        embedding_cols
-    ):
-        raise RuntimeError(
-            "Embedding dimension mismatch: "
-            f"encoder produced {embedding.shape[1]}, "
-            f"but model expects {len(embedding_cols)}"
+        if embedding.ndim != 2:
+            raise RuntimeError(
+                "Unexpected embedding dimensionality: "
+                f"{embedding.shape}"
+            )
+
+        if embedding.shape != (1, len(embedding_cols)):
+            raise RuntimeError(
+                "Embedding dimension mismatch: "
+                f"encoder produced {embedding.shape}, "
+                f"but model expects (1, {len(embedding_cols)})"
+            )
+
+        embedding_frame = pd.DataFrame(
+            embedding,
+            columns=embedding_cols,
+            index=feat.index,
         )
 
-    # Add all embedding columns at once rather than one by one.
-    # This avoids pandas DataFrame fragmentation warnings.
-    embedding_frame = pd.DataFrame(
-        embedding,
-        columns=embedding_cols,
-        index=feat.index,
-    )
-
-    feat = pd.concat(
-        [
-            feat,
-            embedding_frame,
-        ],
-        axis=1,
-    )
-
-    # --------------------------------------------------------
-    # Exact model columns
-    # --------------------------------------------------------
+        feat = pd.concat(
+            [feat, embedding_frame],
+            axis=1,
+        )
 
     feature_cols = (
         list(BUNDLE["numeric_cols"])
@@ -387,9 +384,7 @@ def build_model_frame(
     if missing_features:
         raise RuntimeError(
             "Missing model features: "
-            + ", ".join(
-                missing_features[:20]
-            )
+            + ", ".join(missing_features[:20])
         )
 
     return feat[feature_cols]
@@ -496,19 +491,17 @@ def score_prompt(
                 f"binary model, got {len(probabilities)}"
             )
 
+        # The directly trained deployment target uses:
+        #   0 = scores 3-5
+        #   1 = scores 1-2
+        # sklearn classifiers return classes in sorted order, so
+        # predict_proba columns are [P(0), P(1)].
         probability_map = {
-            "scores_3_5": float(
-                probabilities[0]
-            ),
-            "scores_1_2": float(
-                probabilities[1]
-            ),
+            "scores_3_5": float(probabilities[0]),
+            "scores_1_2": float(probabilities[1]),
         }
 
-        risk = float(
-            probabilities[1]
-        )
-
+        risk = float(probabilities[1])
         risk_1plus2 = risk
 
     else:
@@ -537,10 +530,7 @@ def root():
     return {
         "service": "Prompt Interaction-Risk API",
         "status": "running",
-        "model_loaded": (
-            BUNDLE is not None
-            and ENCODER is not None
-        ),
+        "model_loaded": runtime_ready(),
         "health_endpoint": "/health",
         "score_endpoint": "/score",
         "warmup_endpoint": "/warmup",
@@ -561,10 +551,7 @@ def health():
 
     return {
         "status": "ok",
-        "model_loaded": (
-            BUNDLE is not None
-            and ENCODER is not None
-        ),
+        "model_loaded": runtime_ready(),
         "model_file_exists": MODEL_PATH.exists(),
     }
 
@@ -626,6 +613,11 @@ def warmup():
         "risk_definition": BUNDLE[
             "risk_definition"
         ],
+        "feature_representation": (
+            "handcrafted+MiniLM"
+            if list(BUNDLE.get("embedding_cols", []))
+            else "handcrafted_only"
+        ),
         "load_time_seconds": round(
             elapsed,
             2,

@@ -16,6 +16,7 @@ import sklearn
 import xgboost
 from sentence_transformers import SentenceTransformer
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -160,20 +161,15 @@ def multiclass_model() -> XGBClassifier:
     )
 
 
-def binary_model() -> XGBClassifier:
-    # Same tree specification, adapted only to the binary 1-2 versus 3-5 target.
-    # Use this only after you have evaluated that target in the analysis notebook.
-    return XGBClassifier(
-        objective="binary:logistic",
-        n_estimators=550,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.90,
-        colsample_bytree=0.90,
-        reg_lambda=1.0,
-        eval_metric="logloss",
-        random_state=RANDOM_STATE,
+def binary_model() -> RandomForestClassifier:
+    # Exact Random Forest specification used in the new primary
+    # binary 1+2 versus 3-5 analysis.
+    return RandomForestClassifier(
+        n_estimators=400,
+        min_samples_leaf=2,
+        class_weight="balanced_subsample",
         n_jobs=-1,
+        random_state=RANDOM_STATE,
     )
 
 
@@ -217,22 +213,21 @@ def write_model_requirements(path: Path, versions: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train and export the frozen XGBoost prompt-risk model used by the API."
+        description="Train and export the frozen prompt-risk model used by the API."
     )
     parser.add_argument("--project-dir", required=True, help="Root of the chatGPT_study project")
     parser.add_argument("--data-filename", default="strict_efficiency_50k_with_topics.csv")
     parser.add_argument(
         "--mode",
         choices=["multiclass_class2", "multiclass_1plus2", "binary_1plus2"],
-        default="multiclass_class2",
+        default="binary_1plus2",
         help=(
-            "multiclass_class2 reproduces the current v4 deployment score P(score=2). "
-            "multiclass_1plus2 uses P(score=1)+P(score=2) from that same five-class model. "
-            "binary_1plus2 retrains directly on scores 1-2 vs 3-5 and should only be used "
-            "after that target is formally evaluated."
+            "binary_1plus2 is the new primary deployment target and directly trains "
+            "Random Forest on scores 1-2 versus 3-5. The multiclass modes are "
+            "retained only for backward compatibility with the older v4 deployment."
         ),
     )
-    parser.add_argument("--output", default="model/model_bundle.joblib")
+    parser.add_argument("--output", default="model_bundle.joblib")
     parser.add_argument("--version", default=None, help="Optional human-readable model version")
     args = parser.parse_args()
 
@@ -250,8 +245,15 @@ def main():
     df_feat = build_handcrafted_features(df)
     embeddings = load_or_create_embeddings(project_dir, df_feat, fp)
     embed_cols = [f"prompt_embed_{j}" for j in range(embeddings.shape[1])]
-    for j, col in enumerate(embed_cols):
-        df_feat[col] = embeddings[:, j]
+    embedding_frame = pd.DataFrame(
+        embeddings,
+        columns=embed_cols,
+        index=df_feat.index,
+    )
+    df_feat = pd.concat(
+        [df_feat, embedding_frame],
+        axis=1,
+    )
 
     numeric_cols = HANDCRAFTED_NUMERIC + embed_cols
     feature_cols = numeric_cols + CATEGORICAL
@@ -273,23 +275,51 @@ def main():
             risk_indices = [0, 1]
         class_labels = [1, 2, 3, 4, 5]
     else:
-        y = (df_feat[TARGET_COL].to_numpy() <= 2).astype(int)
+        # New primary deployment target:
+        # 1 = efficiency score 1 or 2
+        # 0 = efficiency score 3, 4 or 5
+        y = (
+            df_feat[TARGET_COL]
+            .isin([1, 2])
+            .astype(int)
+            .to_numpy()
+        )
+
+        print()
+        print("Binary 1+2 target:")
+        print("Positive N:", int(y.sum()))
+        print("Negative N:", int(len(y) - y.sum()))
+        print("Prevalence:", round(float(y.mean()), 4))
+
         pipe = Pipeline([
             ("pre", make_preprocessor(numeric_cols, CATEGORICAL)),
             ("model", binary_model()),
         ])
-        sw = compute_sample_weight(class_weight="balanced", y=y)
-        pipe.fit(X, y, model__sample_weight=sw)
-        risk_definition = "P(strict_efficiency_score in {1,2}) from directly trained binary model"
+
+        # Do not add a second balanced sample weight here:
+        # RandomForest already uses class_weight="balanced_subsample",
+        # matching the evaluated 1+2 specification.
+        pipe.fit(X, y)
+
+        risk_definition = (
+            "P(strict_efficiency_score in {1,2}) "
+            "from directly trained binary model"
+        )
         risk_indices = [1]
         class_labels = ["scores_3_5", "scores_1_2"]
 
+    model_name = "RandomForest" if args.mode == "binary_1plus2" else "XGBoost"
+
     versions = runtime_versions()
-    version = args.version or f"xgb-{args.mode}-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+    version = args.version or (
+        f"jams-v5-rf-1plus2-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+        if args.mode == "binary_1plus2"
+        else f"xgb-{args.mode}-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+    )
 
     bundle = {
         "pipeline": pipe,
-        "model_name": "XGBoost",
+        "model_name": model_name,
         "model_version": version,
         "mode": args.mode,
         "risk_definition": risk_definition,
@@ -310,7 +340,7 @@ def main():
         },
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "runtime_versions": versions,
-        "source": "prompt_efficiency_final_analysis_v4_ready.ipynb",
+        "source": "prompt_efficiency_final_analysis_v4_ready.ipynb + direct binary 1+2 analysis",
     }
 
     joblib.dump(bundle, output_path, compress=3)
@@ -334,9 +364,20 @@ def main():
     enc = SentenceTransformer(EMBEDDING_MODEL_NAME)
     test_df = pd.DataFrame({PROMPT_COL: test_prompts})
     test_feat = build_handcrafted_features(test_df)
-    test_emb = enc.encode(test_prompts, normalize_embeddings=False, show_progress_bar=False)
-    for j, col in enumerate(embed_cols):
-        test_feat[col] = test_emb[:, j]
+    test_emb = enc.encode(
+        test_prompts,
+        normalize_embeddings=False,
+        show_progress_bar=False,
+    )
+    test_embedding_frame = pd.DataFrame(
+        np.asarray(test_emb, dtype=np.float32),
+        columns=embed_cols,
+        index=test_feat.index,
+    )
+    test_feat = pd.concat(
+        [test_feat, test_embedding_frame],
+        axis=1,
+    )
     probs = np.asarray(pipe.predict_proba(test_feat[feature_cols]))
     print("\nSanity-check probabilities:")
     for prompt, p in zip(test_prompts, probs):
@@ -344,8 +385,72 @@ def main():
             risk = float(np.sum(p[risk_indices]))
             print(prompt, "risk=", round(risk, 4), "p1-p5=", np.round(p, 4).tolist())
         else:
-            print(prompt, "risk=", round(float(p[1]), 4), "p=", np.round(p, 4).tolist())
+            print(prompt, "risk_1plus2=", round(float(p[1]), 4), "p(scores_3_5, scores_1_2)=", np.round(p, 4).tolist())
 
 
 if __name__ == "__main__":
     main()
+
+    test_prompts = [
+    # Laptop
+    "Recommend a laptop.",
+    "Recommend a Windows laptop under 1200 euros for Python, commuting and long battery life.",
+
+    # Hotel
+    "Find me a hotel in Paris.",
+    "Find a hotel in Paris for two people, maximum 175 euros per night, with breakfast and good public transport access.",
+
+    # Complaint
+    "Write a complaint email.",
+    "Write a complaint email requesting a refund because I cancelled my subscription before renewal but was still charged.",
+
+    # Writing
+    "Make this better.",
+    "Rewrite this paragraph in a concise academic style while preserving the original meaning.",
+
+    # Recommendation
+    "What phone should I buy?",
+    "Recommend an Android phone under 800 euros, prioritizing camera quality, battery life and at least 256 GB storage.",
+]
+
+test_df = pd.DataFrame({
+    PROMPT_COL: test_prompts
+})
+
+test_feat = build_handcrafted_features(
+    test_df
+)
+
+test_emb = enc.encode(
+    test_prompts,
+    normalize_embeddings=False,
+    show_progress_bar=False,
+)
+
+embed_frame = pd.DataFrame(
+    test_emb,
+    columns=embed_cols,
+    index=test_feat.index,
+)
+
+test_feat = pd.concat(
+    [test_feat, embed_frame],
+    axis=1,
+)
+
+probs = pipe.predict_proba(
+    test_feat[feature_cols]
+)
+
+print("\nPAIRWISE SANITY CHECK")
+print("=" * 70)
+
+for prompt, p in zip(
+    test_prompts,
+    probs
+):
+    print(
+        f"{p[1]:.4f} | {prompt}"
+    )
+
+    
